@@ -49,47 +49,79 @@ def rank_sources(vectorstore: FAISS, query: str, k: int = 5) -> List[Tuple[Docum
     except Exception:
         return []
 
-def format_and_print_response(query: str, answer: str, ranked: List[Tuple[Document, float]]) -> None:
-    """Pretty-print a structured response with ranked sources and file links."""
-    print("\n" + "=" * 70)
-    print("Question:")
-    print(f"- {query.strip()}\n")
-
-    print("Answer:")
-    print(answer.strip())
-
-    if not ranked:
-        return
-
-    print("\nSources (ranked):")
+def format_response(query: str, answer: str, ranked: List[Tuple[Document, float]]) -> dict:
+    """Format the response as a structured JSON object."""
+    # Clean up the answer text by removing the citations section and other formatting
+    clean_answer = answer.strip()
+    
+    # Remove the "Cited sources" section if it exists
+    if "Cited sources:" in clean_answer:
+        clean_answer = clean_answer.split("Cited sources:")[0].strip()
+    
+    # Remove any remaining citation markers like [Source X]
+    import re
+    clean_answer = re.sub(r'\[Source\s+\d+\]', '', clean_answer)
+    
+    # Clean up any double spaces or other artifacts
+    clean_answer = re.sub(r'\s+', ' ', clean_answer).strip()
+    
+    response = {
+        "query": query.strip(),
+        "answer": clean_answer,
+        "caveats": [],
+        "citations": []
+    }
+    
+    # Extract caveats if present in the answer
+    if "3) Assumptions or caveats" in answer:
+        sections = answer.split("3) Assumptions or caveats")
+        if len(sections) > 1:
+            caveats_text = sections[1].split("4) How to apply")[0].strip()
+            if caveats_text and caveats_text.lower() != "none":
+                response["caveats"] = [caveat.strip() for caveat in caveats_text.split("\n") if caveat.strip()]
+    
+    # Process citations
+    base_url = "file:///"  # This can be replaced with your actual base URL if needed
+    
     for idx, (doc, score) in enumerate(ranked, 1):
         src_path = doc.metadata.get("source", "")
         page = doc.metadata.get("page", "?")
         fname = os.path.basename(src_path) if src_path else "unknown"
-        uri = _file_uri(src_path) if src_path else ""
-        # Try to link directly to the page when supported by PDF viewers
-        uri_with_page = uri
-        try:
-            pnum = int(page)
-            if uri:
-                uri_with_page = f"{uri}#page={pnum}"
-        except Exception:
-            pass
-        # Convert FAISS L2 distance to a simple relevance (higher is better). Guard division.
+        
+        # Create clickable link
+        file_uri = _file_uri(src_path)
+        if file_uri and page != "?":
+            try:
+                page_num = int(page)
+                source_link = f"{file_uri}#page={page_num}"
+            except (ValueError, TypeError):
+                source_link = file_uri
+        else:
+            source_link = file_uri
+        
+        # Get snippet of the content
+        snippet = (doc.page_content or "").strip().replace("\n", " ")
+        if len(snippet) > 240:
+            snippet = snippet[:240] + "..."
+            
+        # Calculate relevance score
         try:
             relevance = 1.0 / (1.0 + float(score))
         except Exception:
             relevance = 0.0
-
-        print(f"{idx}. {fname} (page {page})")
-        print(f"   - link: {uri_with_page}")
-        print(f"   - similarity: distance={score:.4f}, relevance~{relevance:.4f}")
-        # Optional short snippet preview
-        snippet = (doc.page_content or "").strip().replace("\n", " ")
-        if len(snippet) > 240:
-            snippet = snippet[:240] + "..."
-        if snippet:
-            print(f"   - snippet: {snippet}")
+            
+        citation = {
+            "id": idx,
+            "source": fname,
+            "source_link": source_link,
+            "page": page,
+            "relevance": round(relevance, 4),
+            "snippet": snippet
+        }
+        
+        response["citations"].append(citation)
+    
+    return response
 
 def process_pdf(pdf_path: str) -> List[Document]:
     """Process a single PDF file and return a list of Document objects."""
@@ -393,9 +425,23 @@ def main():
             ranked = rank_sources(vectorstore, query, k=5)
             # Prefer LLM answer but ensure string
             answer_text = str(result.get('result', '')).strip()
-            format_and_print_response(query, answer_text, ranked)
+            
+            # Get the formatted JSON response
+            response = format_response(query, answer_text, ranked)
+            
+            # Print the pretty-printed JSON
+            print("\n" + "="*70)
+            print("JSON Response:")
+            print(json.dumps(response, indent=2, ensure_ascii=False))
+            
         except Exception as e:
             print(f"Error processing query: {str(e)}")
+            print("Error response:", json.dumps({
+                "query": query,
+                "answer": f"Error processing your request: {str(e)}",
+                "caveats": ["An error occurred while processing your request"],
+                "citations": []
+            }, indent=2))
 
 if __name__ == "__main__":
     main()
