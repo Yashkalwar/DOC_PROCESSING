@@ -6,6 +6,7 @@ from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.vectorstores import FAISS
 from langchain_community.llms import OpenAI
 from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
 import os
 import json
@@ -28,6 +29,67 @@ text_splitter = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", ". ", " ", ""],  # Better handling of technical documents
     is_separator_regex=False,
 )
+
+def _file_uri(path: str) -> str:
+    """Return a file:// URI for a local path."""
+    try:
+        return Path(path).resolve().as_uri()
+    except Exception:
+        return path
+
+def rank_sources(vectorstore: FAISS, query: str, k: int = 5) -> List[Tuple[Document, float]]:
+    """Use the vector store directly to get (Document, score) pairs for the query.
+    Lower scores are more similar for FAISS L2 distance. We'll keep and display both.
+    """
+    try:
+        results = vectorstore.similarity_search_with_score(query, k=k)
+        # results is List[Tuple[Document, score]]; ensure stable ordering by score
+        results.sort(key=lambda x: x[1])
+        return results
+    except Exception:
+        return []
+
+def format_and_print_response(query: str, answer: str, ranked: List[Tuple[Document, float]]) -> None:
+    """Pretty-print a structured response with ranked sources and file links."""
+    print("\n" + "=" * 70)
+    print("Question:")
+    print(f"- {query.strip()}\n")
+
+    print("Answer:")
+    print(answer.strip())
+
+    if not ranked:
+        return
+
+    print("\nSources (ranked):")
+    for idx, (doc, score) in enumerate(ranked, 1):
+        src_path = doc.metadata.get("source", "")
+        page = doc.metadata.get("page", "?")
+        fname = os.path.basename(src_path) if src_path else "unknown"
+        uri = _file_uri(src_path) if src_path else ""
+        # Try to link directly to the page when supported by PDF viewers
+        uri_with_page = uri
+        try:
+            pnum = int(page)
+            if uri:
+                uri_with_page = f"{uri}#page={pnum}"
+        except Exception:
+            pass
+        # Convert FAISS L2 distance to a simple relevance (higher is better). Guard division.
+        try:
+            relevance = 1.0 / (1.0 + float(score))
+        except Exception:
+            relevance = 0.0
+
+        print(f"{idx}. {fname} (page {page})")
+        print(f"   - link: {uri_with_page}")
+        print(f"   - similarity: distance={score:.4f}, relevance~{relevance:.4f}")
+        # Optional short snippet preview
+        snippet = (doc.page_content or "").strip().replace("\n", " ")
+        if len(snippet) > 240:
+            snippet = snippet[:240] + "..."
+        if snippet:
+            print(f"   - snippet: {snippet}")
 
 def process_pdf(pdf_path: str) -> List[Document]:
     """Process a single PDF file and return a list of Document objects."""
@@ -287,7 +349,25 @@ def main():
     )
     
     # Initialize QA chain
-    llm = OpenAI(temperature=0, model_name="gpt-3.5-turbo-instruct")
+    detailed_template = (
+        "You are a helpful technical assistant. Answer the user's question using ONLY the provided context.\n"
+        "If something is not supported by the context, say so explicitly.\n"
+        "Follow this structure and be concise but complete:\n\n"
+        "1) Executive summary (2-4 sentences). Start with a single-sentence DIRECT ANSWER to the question.\n"
+        "   - If the question expects a value, give the value with units in the first sentence.\n"
+        "   - If the answer cannot be determined from the provided documents, say: 'Not determinable from the provided documents.'\n"
+        "   - Optionally add 1-2 short supporting points in the summary with inline citations [Source i].\n"
+        "2) Detailed answer: bullet points and short paragraphs; include quantitative values with units; cite like [Source i].\n"
+        "3) Assumptions or caveats (if any).\n"
+        "4) How to apply this (brief next steps).\n\n"
+        "Citations: Use [Source i] inline where relevant.\n"
+        "At the end, include a 'Cited sources' section listing each [Source i] with file name and page number.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Answer:"
+    )
+    response_prompt = PromptTemplate(template=detailed_template, input_variables=["context", "question"]) 
+    llm = OpenAI(temperature=0.1, model_name="gpt-3.5-turbo-instruct", max_tokens=1200)
     qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
@@ -295,6 +375,7 @@ def main():
             search_type="mmr",  # Maximum marginal relevance for better diversity
             search_kwargs={"k": 5}  # Number of documents to retrieve
         ),
+        chain_type_kwargs={"prompt": response_prompt},
         return_source_documents=True,
         verbose=True
     )
@@ -307,20 +388,12 @@ def main():
             break
             
         try:
-            result = qa({"query": query})
-            print(f"\nAnswer: {result['result']}")
-            
-            # Show unique PDF sources
-            sources = set()
-            for doc in result['source_documents']:
-                source = os.path.basename(doc.metadata.get('source', 'unknown'))
-                sources.add(source)
-            
-            if sources:
-                print("\nSource PDFs:")
-                for i, source in enumerate(sorted(sources), 1):
-                    print(f"{i}. {source}")
-            
+            result = qa.invoke({"query": query})
+            # Rank sources directly from the vector store for consistent scoring
+            ranked = rank_sources(vectorstore, query, k=5)
+            # Prefer LLM answer but ensure string
+            answer_text = str(result.get('result', '')).strip()
+            format_and_print_response(query, answer_text, ranked)
         except Exception as e:
             print(f"Error processing query: {str(e)}")
 
