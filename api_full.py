@@ -155,3 +155,7 @@ async def pdf_checksums():
 async def process_single_pdf(pdf_path: str):
     documents = process_pdf(pdf_path)
     return {"pdf": pdf_path, "chunks": len(documents)}
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run("api_full:app", host="0.0.0.0", port=8000)
